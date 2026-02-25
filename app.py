@@ -17,6 +17,8 @@ FRENCH_MONTHS = {
     "décembre": 12, "decembre": 12
 }
 
+VAT_RATES_ALLOWED = [0.20, 0.10, 0.055, 0.021, 0.0]
+
 def strip_accents(s: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
 
@@ -42,6 +44,53 @@ def to_float(x) -> float:
     except:
         return 0.0
 
+def safe_rate(x) -> float:
+    """
+    Convertit en float et "snap" sur les taux autorisés (2.1 / 5.5 / 10 / 20 / 0).
+    """
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return 0.0
+    if isinstance(x, (int, float, np.number)):
+        v = float(x)
+    else:
+        s = str(x).strip().replace("%", "").replace(",", ".")
+        if s == "":
+            return 0.0
+        try:
+            v = float(s)
+        except:
+            return 0.0
+
+    if v > 1.0:
+        v = v / 100.0
+
+    # snap
+    best = min(VAT_RATES_ALLOWED, key=lambda r: abs(r - v))
+    if abs(best - v) > 0.003:  # tolérance
+        return v
+    return best
+
+def vat_split(ttc: float, rate: float) -> tuple[float, float]:
+    rate = float(rate)
+    if rate <= 0:
+        return (ttc, 0.0)
+    ht = ttc / (1.0 + rate)
+    tva = ttc - ht
+    return (ht, tva)
+
+def mk_line(journal, dt_, piece, compte, libelle, debit, credit, dossier, tva_rate=None):
+    return {
+        "Journal": journal,
+        "Date": dt_.isoformat(),
+        "Piece": piece,
+        "Compte": str(compte),
+        "Libelle": libelle,
+        "Debit": round(float(debit), 2),
+        "Credit": round(float(credit), 2),
+        "Dossier": dossier or "",
+        "TVA_rate": "" if tva_rate is None else tva_rate,
+    }
+
 def extract_dossier_number(raw_df: pd.DataFrame) -> str | None:
     max_r = min(50, raw_df.shape[0])
     max_c = min(25, raw_df.shape[1])
@@ -65,7 +114,7 @@ def extract_period_from_sheetname(sheet_name: str) -> tuple[int, int] | None:
             return (year, month)
     return None
 
-def find_row_contains(raw_df: pd.DataFrame, needle: str, search_rows: int = 120) -> int | None:
+def find_row_contains(raw_df: pd.DataFrame, needle: str, search_rows: int = 140) -> int | None:
     n = norm(needle)
     for r in range(min(search_rows, raw_df.shape[0])):
         row_text = " ".join(norm(x) for x in raw_df.iloc[r].tolist())
@@ -73,77 +122,39 @@ def find_row_contains(raw_df: pd.DataFrame, needle: str, search_rows: int = 120)
             return r
     return None
 
-def vat_split(ttc: float, rate: float) -> tuple[float, float]:
-    rate = float(rate)
-    if rate <= 0:
-        return (ttc, 0.0)
-    ht = ttc / (1.0 + rate)
-    tva = ttc - ht
-    return (ht, tva)
-
-def mk_line(journal, dt_, piece, compte, libelle, debit, credit, dossier, tva_rate=None):
-    return {
-        "Journal": journal,
-        "Date": dt_.isoformat(),
-        "Piece": piece,
-        "Compte": str(compte),
-        "Libelle": libelle,
-        "Debit": round(float(debit), 2),
-        "Credit": round(float(credit), 2),
-        "Dossier": dossier or "",
-        "TVA_rate": "" if tva_rate is None else tva_rate,
-    }
-
 # ============================================================
-# Détection blocs RECETTES / DEPENSES par "bornage"
+# Détection blocs RECETTES / DEPENSES par bornage
+#   + exclusion colonnes Total / Solde progressif / Intitulé
 # ============================================================
+
+EXCLUDE_HEADER_TOKENS = ["TOTAL", "SOLDE", "PROGRESSIF", "PROGRESSIVE", "INTITULE", "INTITULES", "INTITULEE", "INTITULEES"]
+
+def is_excluded_column(label_norm: str) -> bool:
+    if not label_norm:
+        return True
+    return any(tok in label_norm for tok in EXCLUDE_HEADER_TOKENS)
 
 def detect_block_ranges(raw_df: pd.DataFrame) -> dict:
-    """
-    But:
-      - identifier les colonnes couvertes par le bloc RECETTES et par le bloc DEPENSES
-      - sans dépendre des libellés internes (peu importe nb de colonnes / noms)
-    Hypothèse fréquente:
-      - ligne "niveau 1" contient des titres de blocs (RECETTES / DEPENSES) souvent en cellules fusionnées
-      - ligne "niveau 2" juste en dessous contient les libellés de colonnes
-    Stratégie:
-      - on cherche la première ligne qui contient RECETTES
-      - sur cette ligne, on repère toutes les colonnes où le texte contient RECETTES / DEPENSES
-      - on déduit les intervalles de colonnes de chaque bloc
-    Retour:
-      {
-        "row_block": int,
-        "row_cols": int,
-        "recettes": (start_col, end_col_inclusive),
-        "depenses": (start_col, end_col_inclusive)
-      }
-    """
     r_block = find_row_contains(raw_df, "RECETTES")
     if r_block is None:
         raise ValueError("Impossible de trouver un titre de bloc 'RECETTES' dans l'onglet.")
 
-    # on prend la ligne suivante comme libellés colonnes (souvent)
     r_cols = min(r_block + 1, raw_df.shape[0] - 1)
-
     row_vals = [norm(x) for x in raw_df.iloc[r_block].tolist()]
 
     rec_positions = [i for i, v in enumerate(row_vals) if "RECETTES" in v]
     dep_positions = [i for i, v in enumerate(row_vals) if "DEPENSES" in v]
+    if not dep_positions:
+        dep_positions = [i for i, v in enumerate(row_vals) if "DEPENSE" in v]
 
     if not rec_positions:
         raise ValueError("Bloc 'RECETTES' introuvable (sur la ligne titre).")
-    if not dep_positions:
-        # certains fichiers écrivent "DEPENSE" sans S
-        dep_positions = [i for i, v in enumerate(row_vals) if "DEPENSE" in v]
     if not dep_positions:
         raise ValueError("Bloc 'DEPENSES' introuvable (sur la ligne titre).")
 
     rec_start = min(rec_positions)
     dep_start = min(dep_positions)
 
-    # bornes :
-    # recettes = de rec_start à (dep_start - 1)
-    # depenses = de dep_start à fin (ou jusqu'à prochaine section si existe)
     rec_end = dep_start - 1
     dep_end = raw_df.shape[1] - 1
 
@@ -158,23 +169,15 @@ def detect_block_ranges(raw_df: pd.DataFrame) -> dict:
     }
 
 def get_columns_under_block(raw_df: pd.DataFrame, row_cols: int, start: int, end: int) -> list[dict]:
-    """
-    Récupère la liste des colonnes (index + libellé) sous un bloc, en excluant TOTAL.
-    """
     cols = []
     for c in range(start, end + 1):
         label = norm(raw_df.iat[row_cols, c])
-        if not label:
-            continue
-        if "TOTAL" in label:
+        if is_excluded_column(label):
             continue
         cols.append({"col_index": c, "label": label})
     return cols
 
 def find_day_col(raw_df: pd.DataFrame, row_cols: int) -> int:
-    """
-    Trouve la colonne du jour si libellé "JOUR" existe, sinon 0.
-    """
     for c in range(raw_df.shape[1]):
         if "JOUR" in norm(raw_df.iat[row_cols, c]):
             return c
@@ -185,7 +188,6 @@ def parse_cash_sheet_bounded(raw_df: pd.DataFrame, sheet_name: str) -> dict:
 
     ym = extract_period_from_sheetname(sheet_name)
     if not ym:
-        # fallback: si une cellule "PERIODE" existe
         r_per = find_row_contains(raw_df, "PERIODE")
         if r_per is not None:
             for c in range(raw_df.shape[1]):
@@ -204,7 +206,6 @@ def parse_cash_sheet_bounded(raw_df: pd.DataFrame, sheet_name: str) -> dict:
     except Exception as e:
         return {"ok": False, "error": f"Onglet '{sheet_name}': {e}"}
 
-    row_block = blocks["row_block"]
     row_cols = blocks["row_cols"]
     rec_start, rec_end = blocks["recettes"]
     dep_start, dep_end = blocks["depenses"]
@@ -212,17 +213,13 @@ def parse_cash_sheet_bounded(raw_df: pd.DataFrame, sheet_name: str) -> dict:
     recettes_cols = get_columns_under_block(raw_df, row_cols, rec_start, rec_end)
     depenses_cols = get_columns_under_block(raw_df, row_cols, dep_start, dep_end)
 
-    # colonne jour
     day_col = find_day_col(raw_df, row_cols)
-
-    # Parcours des lignes après row_cols (souvent row_cols + 1)
     start_data = row_cols + 1
 
     rows = []
     for r in range(start_data, raw_df.shape[0]):
         v_day = raw_df.iat[r, day_col]
 
-        # arrêt si ligne "TOTAL" dans la colonne jour
         if isinstance(v_day, str) and norm(v_day) == "TOTAL":
             break
 
@@ -239,14 +236,8 @@ def parse_cash_sheet_bounded(raw_df: pd.DataFrame, sheet_name: str) -> dict:
         except:
             continue
 
-        # montants recettes et dépenses sous forme "col_label -> montant"
-        rec_values = {}
-        for c in recettes_cols:
-            rec_values[c["label"]] = to_float(raw_df.iat[r, c["col_index"]])
-
-        dep_values = {}
-        for c in depenses_cols:
-            dep_values[c["label"]] = to_float(raw_df.iat[r, c["col_index"]])
+        rec_values = {c["label"]: to_float(raw_df.iat[r, c["col_index"]]) for c in recettes_cols}
+        dep_values = {c["label"]: to_float(raw_df.iat[r, c["col_index"]]) for c in depenses_cols}
 
         rows.append({
             "dossier": dossier,
@@ -272,34 +263,21 @@ def parse_cash_sheet_bounded(raw_df: pd.DataFrame, sheet_name: str) -> dict:
 
 # ============================================================
 # Paramétrage dynamique par colonnes détectées
+#   - Si aucun compte paramétré => AUCUNE écriture
+#   - TVA collectée / déductible par taux (paramétrable)
 # ============================================================
 
 PARAM_COLUMNS = ["bloc", "colonne", "type", "compte", "compte_contrepartie", "tva_rate", "libelle"]
 
 def default_type_guess(bloc: str, col_label: str) -> str:
-    """
-    Proposition automatique (modifiable):
-      - RECETTES -> vente
-      - DEPENSES :
-          - si contient DEPOT/REMISE/VERSEMENT -> depot
-          - sinon -> charge
-    """
     s = norm(col_label)
     if bloc == "RECETTES":
         return "vente"
-    # DEPENSES
     if any(k in s for k in ["DEPOT", "REMISE", "VERSEMENT"]):
         return "depot"
     return "charge"
 
 def default_account_guess(bloc: str, col_label: str) -> tuple[str, str]:
-    """
-    Proposition simple (à adapter):
-      - vente : espèces->531, chèques->5112, cartes/cb->5111, sinon 531
-      - depot : banque 512, contrepartie selon moyen (531/5112/5111)
-      - charge : 606 si fournisseurs/achats sinon 623 ; contrepartie caisse 531
-    Retour: (compte, compte_contrepartie)
-    """
     s = norm(col_label)
 
     if bloc == "RECETTES":
@@ -313,7 +291,6 @@ def default_account_guess(bloc: str, col_label: str) -> tuple[str, str]:
 
     # DEPENSES
     if any(k in s for k in ["DEPOT", "REMISE", "VERSEMENT"]):
-        # mouvement banque
         if any(k in s for k in ["ESPECES", "ESPECE", "CASH"]):
             return ("512000", "531000")
         if any(k in s for k in ["CHEQUE", "CHEQUES", "CHQ"]):
@@ -322,15 +299,13 @@ def default_account_guess(bloc: str, col_label: str) -> tuple[str, str]:
             return ("512000", "511100")
         return ("512000", "531000")
 
-    # charge
     if any(k in s for k in ["FOURNISSEUR", "FOURNISSEURS", "ACHAT", "ACHATS"]):
         return ("606000", "531000")
     return ("623000", "531000")
 
-def build_default_param_from_detected(rec_cols: list[dict], dep_cols: list[dict]) -> pd.DataFrame:
+def build_default_param_from_detected(rec_cols: list[str], dep_cols: list[str]) -> pd.DataFrame:
     rows = []
-    for c in rec_cols:
-        col_label = c["label"]
+    for col_label in rec_cols:
         typ = default_type_guess("RECETTES", col_label)
         compte, cp = default_account_guess("RECETTES", col_label)
         rows.append({
@@ -340,11 +315,10 @@ def build_default_param_from_detected(rec_cols: list[dict], dep_cols: list[dict]
             "compte": compte,
             "compte_contrepartie": cp,
             "tva_rate": 0.20 if typ in ["vente", "charge"] else "",
-            "libelle": f"{col_label.title()}",
+            "libelle": col_label.title(),
         })
 
-    for c in dep_cols:
-        col_label = c["label"]
+    for col_label in dep_cols:
         typ = default_type_guess("DEPENSES", col_label)
         compte, cp = default_account_guess("DEPENSES", col_label)
         rows.append({
@@ -354,17 +328,13 @@ def build_default_param_from_detected(rec_cols: list[dict], dep_cols: list[dict]
             "compte": compte,
             "compte_contrepartie": cp,
             "tva_rate": 0.20 if typ in ["vente", "charge"] else "",
-            "libelle": f"{col_label.title()}",
+            "libelle": col_label.title(),
         })
 
     df = pd.DataFrame(rows)
     return df[PARAM_COLUMNS].copy()
 
 def param_df_to_map(param_df: pd.DataFrame) -> dict:
-    """
-    key = (bloc, colonne_norm)
-    value = dict(type, compte, compte_contrepartie, tva_rate, libelle)
-    """
     m = {}
     for _, r in param_df.iterrows():
         bloc = norm(r.get("bloc"))
@@ -375,116 +345,163 @@ def param_df_to_map(param_df: pd.DataFrame) -> dict:
             "type": str(r.get("type", "")).strip().lower(),
             "compte": str(r.get("compte", "")).strip(),
             "compte_contrepartie": str(r.get("compte_contrepartie", "")).strip(),
-            "tva_rate": r.get("tva_rate", ""),
+            "tva_rate": safe_rate(r.get("tva_rate", "")),
             "libelle": str(r.get("libelle", "")).strip(),
         }
     return m
 
+def get_vat_account(vat_map: dict, kind: str, rate: float) -> str:
+    """
+    kind: 'collected' ou 'deductible'
+    vat_map: dict {('collected', 0.2): '445710', ...}
+    """
+    rate = safe_rate(rate)
+    return (vat_map.get((kind, rate)) or "").strip()
+
 # ============================================================
-# Génération des écritures à partir des valeurs colonnes
+# Génération des écritures
+#   - pas d'écriture si compte manquant
+#   - TVA collectée/déductible par taux
 # ============================================================
 
-def generate_entries_for_day(journal: str,
-                             dossier: str,
-                             dt_: date,
-                             piece: str,
-                             rec_values: dict,
-                             dep_values: dict,
-                             param_map: dict,
-                             global_params: dict,
-                             group_monthly: bool):
-    """
-    Global params attendus:
-      - sales_revenue_acct
-      - sales_vat_acct
-      - expense_vat_acct
-      - default_payment_acct (crédit pour charges si pas de compte_contrepartie)
-    """
+def generate_entries_for_period(
+    journal: str,
+    dossier: str,
+    dt_piece: date,
+    piece: str,
+    rec_values: dict,
+    dep_values: dict,
+    param_map: dict,
+    revenue_acct: str,
+    vat_accounts: dict,      # {('collected', rate): acct, ('deductible', rate): acct}
+    default_payment_acct: str,
+    issues: list
+):
     lines = []
 
-    # ---------- RECETTES / VENTES ----------
-    # On cumule TTC des colonnes typées "vente"
-    sales_ttc_by_col = []
-    total_sales_ttc = 0.0
-    used_vat_rate = None  # si plusieurs taux, on garde celui du 1er (tu peux améliorer plus tard)
+    revenue_acct = (revenue_acct or "").strip()
+    if not revenue_acct:
+        issues.append({"piece": piece, "type": "PARAM_GLOBAL", "detail": "Compte CA (HT) manquant => aucune écriture de ventes possible."})
 
+    # -------- VENTES (RECETTES / type=vente) --------
+    # 1) Débits TTC sur comptes de règlement (par colonne)
+    # 2) Crédit CA HT (compte global)
+    # 3) Crédit TVA collectée (compte par taux)
+    sales_ttc_by_rate = {}  # rate -> ttc
     for col_label, amount in rec_values.items():
         if amount <= 0:
             continue
         key = ("RECETTES", norm(col_label))
         p = param_map.get(key)
         if not p:
+            issues.append({"piece": piece, "type": "PARAM_MISSING", "detail": f"Recette '{col_label}': pas de ligne de paramétrage => ignorée."})
             continue
         if p["type"] != "vente":
             continue
 
-        acct = p["compte"]
+        acct = (p["compte"] or "").strip()
+        if not acct:
+            issues.append({"piece": piece, "type": "ACCOUNT_MISSING", "detail": f"Recette '{col_label}': compte vide => aucune écriture générée pour cette colonne."})
+            continue
+
+        rate = safe_rate(p.get("tva_rate", 0.0))
         lib = p["libelle"] or col_label
-        rate = p["tva_rate"]
-        try:
-            rate_f = float(str(rate).replace(",", ".")) if rate != "" else 0.0
-        except:
-            rate_f = 0.0
 
-        if used_vat_rate is None:
-            used_vat_rate = rate_f
+        lines.append(mk_line(journal, dt_piece, piece, acct, lib, debit=amount, credit=0, dossier=dossier, tva_rate=rate))
+        sales_ttc_by_rate[rate] = sales_ttc_by_rate.get(rate, 0.0) + float(amount)
 
-        lines.append(mk_line(journal, dt_, piece, acct, lib, debit=amount, credit=0, dossier=dossier, tva_rate=rate_f))
-        total_sales_ttc += amount
-        sales_ttc_by_col.append((col_label, amount))
+    # Credits CA + TVA par taux
+    for rate, ttc in sales_ttc_by_rate.items():
+        if ttc <= 0:
+            continue
+        if not revenue_acct:
+            continue
 
-    if total_sales_ttc > 0:
-        rate_f = used_vat_rate if used_vat_rate is not None else 0.0
-        ht, tva = vat_split(total_sales_ttc, rate_f)
-        lines.append(mk_line(journal, dt_, piece, global_params["sales_revenue_acct"], "Chiffre d'affaires (HT)", debit=0, credit=ht, dossier=dossier, tva_rate=rate_f))
+        ht, tva = vat_split(ttc, rate)
+        # Crédit CA HT
+        lines.append(mk_line(journal, dt_piece, piece, revenue_acct, f"Chiffre d'affaires HT ({rate*100:.1f}%)", debit=0, credit=ht, dossier=dossier, tva_rate=rate))
+
+        # Crédit TVA collectée (par taux)
         if tva > 0:
-            lines.append(mk_line(journal, dt_, piece, global_params["sales_vat_acct"], "TVA collectée", debit=0, credit=tva, dossier=dossier, tva_rate=rate_f))
+            vat_acct = get_vat_account(vat_accounts, "collected", rate)
+            if not vat_acct:
+                issues.append({"piece": piece, "type": "VAT_ACCOUNT_MISSING", "detail": f"TVA collectée {rate*100:.1f}%: compte non paramétré => TVA non comptabilisée."})
+            else:
+                lines.append(mk_line(journal, dt_piece, piece, vat_acct, f"TVA collectée ({rate*100:.1f}%)", debit=0, credit=tva, dossier=dossier, tva_rate=rate))
 
-    # ---------- DEPENSES ----------
-    # Deux cas : depot (mouvement trésorerie) / charge
+    # -------- DEPENSES (DEPENSES) --------
     for col_label, amount in dep_values.items():
         if amount <= 0:
             continue
         key = ("DEPENSES", norm(col_label))
         p = param_map.get(key)
         if not p:
+            issues.append({"piece": piece, "type": "PARAM_MISSING", "detail": f"Dépense '{col_label}': pas de ligne de paramétrage => ignorée."})
             continue
 
         typ = p["type"]
-        acct = p["compte"]
-        cp = p["compte_contrepartie"] or global_params["default_payment_acct"]
+        acct = (p["compte"] or "").strip()
+        cp = (p["compte_contrepartie"] or "").strip() or (default_payment_acct or "").strip()
+
         lib = p["libelle"] or col_label
 
-        # depot : débit banque (acct=512) / crédit cp (531/511)
         if typ == "depot":
-            lines.append(mk_line(journal, dt_, piece, acct, lib, debit=amount, credit=0, dossier=dossier))
-            lines.append(mk_line(journal, dt_, piece, cp,   lib, debit=0, credit=amount, dossier=dossier))
+            # debit banque (acct) / credit cp
+            if not acct:
+                issues.append({"piece": piece, "type": "ACCOUNT_MISSING", "detail": f"Dépôt '{col_label}': compte banque vide => ignoré."})
+                continue
+            if not cp:
+                issues.append({"piece": piece, "type": "ACCOUNT_MISSING", "detail": f"Dépôt '{col_label}': compte contrepartie vide => ignoré."})
+                continue
+            lines.append(mk_line(journal, dt_piece, piece, acct, lib, debit=amount, credit=0, dossier=dossier))
+            lines.append(mk_line(journal, dt_piece, piece, cp,   lib, debit=0, credit=amount, dossier=dossier))
 
-        # charge : débit charge HT + débit TVA / crédit cp TTC
         elif typ == "charge":
-            rate = p["tva_rate"]
-            try:
-                rate_f = float(str(rate).replace(",", ".")) if rate != "" else 0.0
-            except:
-                rate_f = 0.0
+            # debit charge HT + debit TVA ded / credit cp TTC
+            if not acct:
+                issues.append({"piece": piece, "type": "ACCOUNT_MISSING", "detail": f"Charge '{col_label}': compte de charge vide => ignorée."})
+                continue
+            if not cp:
+                issues.append({"piece": piece, "type": "ACCOUNT_MISSING", "detail": f"Charge '{col_label}': compte paiement vide => ignorée."})
+                continue
 
-            ht, tva = vat_split(amount, rate_f)
-            lines.append(mk_line(journal, dt_, piece, acct, f"{lib} (HT)", debit=ht, credit=0, dossier=dossier, tva_rate=rate_f))
+            rate = safe_rate(p.get("tva_rate", 0.0))
+            ht, tva = vat_split(amount, rate)
+
+            lines.append(mk_line(journal, dt_piece, piece, acct, f"{lib} (HT)", debit=ht, credit=0, dossier=dossier, tva_rate=rate))
+
             if tva > 0:
-                lines.append(mk_line(journal, dt_, piece, global_params["expense_vat_acct"], "TVA déductible", debit=tva, credit=0, dossier=dossier, tva_rate=rate_f))
-            lines.append(mk_line(journal, dt_, piece, cp, lib, debit=0, credit=amount, dossier=dossier, tva_rate=rate_f))
+                vat_acct = get_vat_account(vat_accounts, "deductible", rate)
+                if not vat_acct:
+                    issues.append({"piece": piece, "type": "VAT_ACCOUNT_MISSING", "detail": f"TVA déductible {rate*100:.1f}%: compte non paramétré => TVA non comptabilisée."})
+                else:
+                    lines.append(mk_line(journal, dt_piece, piece, vat_acct, f"TVA déductible ({rate*100:.1f}%)", debit=tva, credit=0, dossier=dossier, tva_rate=rate))
 
-        # si quelqu'un met "vente" côté dépenses, on ignore (ou on pourrait traiter autrement)
+            lines.append(mk_line(journal, dt_piece, piece, cp, lib, debit=0, credit=amount, dossier=dossier, tva_rate=rate))
+
         else:
+            # inconnu => ignore
+            issues.append({"piece": piece, "type": "PARAM_INVALID", "detail": f"Dépense '{col_label}': type '{typ}' non géré => ignorée."})
             continue
 
     return lines
 
 # ============================================================
+# Contrôles
+# ============================================================
+
+def balance_check(out_df: pd.DataFrame) -> pd.DataFrame:
+    if out_df.empty:
+        return pd.DataFrame(columns=["Piece", "Debit", "Credit", "Ecart"])
+    g = out_df.groupby("Piece", dropna=False).agg({"Debit": "sum", "Credit": "sum"}).reset_index()
+    g["Ecart"] = (g["Debit"] - g["Credit"]).round(2)
+    return g
+
+# ============================================================
 # UI
 # ============================================================
 
-st.title("🧾 Générateur d'écritures comptables – Feuilles de caisse Excel (bornage blocs)")
+st.title("🧾 Générateur d'écritures – Feuilles de caisse (bornage blocs + TVA multi-taux)")
 
 with st.sidebar:
     st.header("1) Import")
@@ -494,18 +511,39 @@ with st.sidebar:
     param_file = st.file_uploader("Importer paramétrage (CSV ;)", type=["csv"])
 
     st.divider()
-    st.markdown("**Comptes globaux**")
-    sales_revenue_acct = st.text_input("Compte CA (HT)", value="706000")
-    sales_vat_acct = st.text_input("TVA collectée", value="445710")
-    expense_vat_acct = st.text_input("TVA déductible", value="445660")
+    st.markdown("### Comptes globaux (défauts PCG / Pennylane)")
+    revenue_acct = st.text_input("Compte CA (HT)", value="706000")
     default_payment_acct = st.text_input("Compte paiement charges (si vide)", value="531000")
+
+    st.markdown("### TVA collectée (par taux)")
+    vat_col_20 = st.text_input("TVA collectée 20%", value="445710")
+    vat_col_10 = st.text_input("TVA collectée 10%", value="445712")
+    vat_col_55 = st.text_input("TVA collectée 5.5%", value="445713")
+    vat_col_21 = st.text_input("TVA collectée 2.1%", value="445714")
+
+    st.markdown("### TVA déductible (par taux)")
+    vat_ded_20 = st.text_input("TVA déductible 20%", value="445660")
+    vat_ded_10 = st.text_input("TVA déductible 10%", value="445662")
+    vat_ded_55 = st.text_input("TVA déductible 5.5%", value="445663")
+    vat_ded_21 = st.text_input("TVA déductible 2.1%", value="445664")
 
 if not files:
     st.info("Importe au moins un fichier Excel pour commencer.")
     st.stop()
 
+vat_accounts = {
+    ("collected", 0.20): vat_col_20.strip(),
+    ("collected", 0.10): vat_col_10.strip(),
+    ("collected", 0.055): vat_col_55.strip(),
+    ("collected", 0.021): vat_col_21.strip(),
+    ("deductible", 0.20): vat_ded_20.strip(),
+    ("deductible", 0.10): vat_ded_10.strip(),
+    ("deductible", 0.055): vat_ded_55.strip(),
+    ("deductible", 0.021): vat_ded_21.strip(),
+}
+
 # ============================================================
-# Liste des onglets + sélection
+# Onglets: sélection
 # ============================================================
 st.subheader("1) Choix des onglets à traiter")
 
@@ -541,13 +579,13 @@ if selected.empty:
     st.stop()
 
 # ============================================================
-# Parse des onglets sélectionnés
+# Parsing + colonnes détectées (union)
 # ============================================================
-st.subheader("2) Lecture & détection des colonnes (RECETTES / DEPENSES)")
+st.subheader("2) Lecture & colonnes détectées (TOTAL / SOLDE / INTITULÉ exclus)")
 
 all_days = []
 meta = []
-detected_columns_union = {"RECETTES": set(), "DEPENSES": set()}
+detected_union = {"RECETTES": set(), "DEPENSES": set()}
 debug = []
 
 for f in files:
@@ -561,11 +599,10 @@ for f in files:
                 st.warning(parsed["error"])
                 continue
 
-            # union colonnes détectées
             for c in parsed["recettes_cols"]:
-                detected_columns_union["RECETTES"].add(c["label"])
+                detected_union["RECETTES"].add(c["label"])
             for c in parsed["depenses_cols"]:
-                detected_columns_union["DEPENSES"].add(c["label"])
+                detected_union["DEPENSES"].add(c["label"])
 
             meta.append({
                 "file": f.name,
@@ -598,42 +635,33 @@ if not all_days:
     st.stop()
 
 meta_df = pd.DataFrame(meta).drop_duplicates()
-days_df = pd.DataFrame(all_days)  # colonnes: dossier, sheet, date, rec_values, dep_values
+days_df = pd.DataFrame(all_days)
 
 with st.expander("🔍 Debug détection (si un onglet ne passe pas)"):
     st.dataframe(pd.DataFrame(debug), use_container_width=True)
 
+rec_cols_list = sorted(list(detected_union["RECETTES"]))
+dep_cols_list = sorted(list(detected_union["DEPENSES"]))
+
+cA, cB = st.columns(2)
+with cA:
+    st.markdown("### Colonnes RECETTES")
+    st.dataframe(pd.DataFrame({"colonne": rec_cols_list}), use_container_width=True, height=230)
+with cB:
+    st.markdown("### Colonnes DEPENSES")
+    st.dataframe(pd.DataFrame({"colonne": dep_cols_list}), use_container_width=True, height=230)
+
 # ============================================================
-# Affiche colonnes détectées + propose paramétrage
+# Paramétrage (auto + import)
 # ============================================================
-st.subheader("3) Colonnes détectées (hors TOTAL)")
-
-rec_cols_list = sorted(list(detected_columns_union["RECETTES"]))
-dep_cols_list = sorted(list(detected_columns_union["DEPENSES"]))
-
-colA, colB = st.columns(2)
-with colA:
-    st.markdown("### RECETTES")
-    st.dataframe(pd.DataFrame({"colonne": rec_cols_list}), use_container_width=True, height=250)
-
-with colB:
-    st.markdown("### DEPENSES")
-    st.dataframe(pd.DataFrame({"colonne": dep_cols_list}), use_container_width=True, height=250)
-
-# Paramétrage : soit import CSV ; soit génération auto depuis colonnes détectées
-st.subheader("4) Paramétrage par colonnes")
-st.caption("Le paramétrage associe chaque colonne détectée à un type (vente / depot / charge) et à des comptes.")
+st.subheader("3) Paramétrage par colonnes (si compte vide => pas d'écriture)")
 
 if "param_df" not in st.session_state:
-    st.session_state.param_df = build_default_param_from_detected(
-        rec_cols=[{"label": c} for c in rec_cols_list],
-        dep_cols=[{"label": c} for c in dep_cols_list]
-    )
+    st.session_state.param_df = build_default_param_from_detected(rec_cols_list, dep_cols_list)
 
 if param_file is not None:
     try:
         p = pd.read_csv(param_file, sep=";")
-        # assure colonnes
         for c in PARAM_COLUMNS:
             if c not in p.columns:
                 p[c] = ""
@@ -642,11 +670,9 @@ if param_file is not None:
     except Exception as e:
         st.error(f"❌ Import paramétrage impossible : {e}")
 
-# bouton téléchargement param auto (pratique)
-param_auto_csv = st.session_state.param_df.to_csv(index=False, sep=";").encode("utf-8")
 st.download_button(
-    "⬇️ Télécharger le paramétrage actuel (CSV ;)",
-    data=param_auto_csv,
+    "⬇️ Télécharger paramétrage (CSV ;)",
+    data=st.session_state.param_df.to_csv(index=False, sep=";").encode("utf-8"),
     file_name="parametrage_colonnes_feuille_caisse.csv",
     mime="text/csv"
 )
@@ -662,20 +688,19 @@ param_df = st.data_editor(
     }
 )
 st.session_state.param_df = param_df
-
 param_map = param_df_to_map(param_df)
 
 # ============================================================
 # Filtrage dossier + mois
 # ============================================================
-st.subheader("5) Filtrer : N° dossier + mois")
+st.subheader("4) Filtrer : dossier + mois")
 
 dossiers = sorted([d for d in meta_df["dossier"].unique().tolist() if str(d).strip() != ""])
 if not dossiers:
     dossiers = [""]
 
-c1, c2, c3 = st.columns([2, 2, 2])
-with c1:
+x1, x2, x3 = st.columns([2, 2, 2])
+with x1:
     dossier_sel = st.selectbox("N° dossier", options=dossiers, index=0)
 
 periods = meta_df.loc[meta_df["dossier"] == dossier_sel, "period"].unique().tolist()
@@ -684,10 +709,10 @@ if not periods:
     st.warning("Aucune période trouvée pour ce dossier.")
     st.stop()
 
-with c2:
+with x2:
     period_sel = st.selectbox("Mois (YYYY-MM)", options=periods, index=0)
 
-with c3:
+with x3:
     journal = st.text_input("Journal", value="CAIS")
 
 sel_year, sel_month = map(int, period_sel.split("-"))
@@ -702,33 +727,22 @@ if df_sel.empty:
     st.stop()
 
 # ============================================================
-# Choix pièce : jour / mois
+# Pièces + génération
 # ============================================================
-st.subheader("6) Génération des écritures")
+st.subheader("5) Génération des écritures + contrôles")
+
 piece_mode = st.radio("Numéro de pièce", ["Par jour (recommandé)", "Mensuel (1 pièce)"], horizontal=True)
 group_monthly = (piece_mode == "Mensuel (1 pièce)")
 
-global_params = {
-    "sales_revenue_acct": sales_revenue_acct.strip() or "706000",
-    "sales_vat_acct": sales_vat_acct.strip() or "445710",
-    "expense_vat_acct": expense_vat_acct.strip() or "445660",
-    "default_payment_acct": default_payment_acct.strip() or "531000",
-}
-
-# ============================================================
-# Construction écritures
-# ============================================================
+issues = []
 lines = []
 
 if group_monthly:
-    # Agrège toutes les colonnes du mois
     dt_piece = date(sel_year, sel_month, 1)
     piece = f"{dossier_sel}-{dt_piece.strftime('%Y%m')}-MOIS"
 
-    # agrégation dictionnaires
     rec_agg = {}
     dep_agg = {}
-
     for _, r in df_sel.iterrows():
         rv = r["rec_values"] or {}
         dv = r["dep_values"] or {}
@@ -737,49 +751,54 @@ if group_monthly:
         for k, v in dv.items():
             dep_agg[k] = dep_agg.get(k, 0.0) + float(v)
 
-    lines.extend(generate_entries_for_day(
+    lines.extend(generate_entries_for_period(
         journal=journal,
         dossier=dossier_sel,
-        dt_=dt_piece,
+        dt_piece=dt_piece,
         piece=piece,
         rec_values=rec_agg,
         dep_values=dep_agg,
         param_map=param_map,
-        global_params=global_params,
-        group_monthly=True
+        revenue_acct=revenue_acct,
+        vat_accounts=vat_accounts,
+        default_payment_acct=default_payment_acct,
+        issues=issues
     ))
 else:
     for _, r in df_sel.iterrows():
-        dt_ = pd.to_datetime(r["date"]).date()
-        piece = f"{dossier_sel}-{dt_.strftime('%Y%m%d')}-JOUR"
-        lines.extend(generate_entries_for_day(
+        dt_piece = pd.to_datetime(r["date"]).date()
+        piece = f"{dossier_sel}-{dt_piece.strftime('%Y%m%d')}-JOUR"
+        lines.extend(generate_entries_for_period(
             journal=journal,
             dossier=dossier_sel,
-            dt_=dt_,
+            dt_piece=dt_piece,
             piece=piece,
             rec_values=r["rec_values"] or {},
             dep_values=r["dep_values"] or {},
             param_map=param_map,
-            global_params=global_params,
-            group_monthly=False
+            revenue_acct=revenue_acct,
+            vat_accounts=vat_accounts,
+            default_payment_acct=default_payment_acct,
+            issues=issues
         ))
 
 out_df = pd.DataFrame(lines)
 if not out_df.empty:
     out_df = out_df[~((out_df["Debit"] == 0) & (out_df["Credit"] == 0))].copy()
 
-# ============================================================
-# Affichage + export
-# ============================================================
-st.subheader("7) Contrôle & export")
+# Contrôle équilibre débit/crédit
+bal_df = balance_check(out_df)
+unbalanced = bal_df[bal_df["Ecart"].abs() > 0.01].copy()
 
-# Affiche un aperçu "aplati" des données du mois pour contrôle
+# ============================================================
+# Affichages
+# ============================================================
+
 def flatten_values(df: pd.DataFrame, field: str, all_cols: list[str]) -> pd.DataFrame:
     tmp = df[["date", field]].copy()
     for c in all_cols:
         tmp[c] = tmp[field].apply(lambda d: float(d.get(c, 0.0)) if isinstance(d, dict) else 0.0)
-    tmp = tmp.drop(columns=[field])
-    return tmp
+    return tmp.drop(columns=[field])
 
 with st.expander("Aperçu RECETTES (détail colonnes)"):
     st.dataframe(flatten_values(df_sel, "rec_values", rec_cols_list), use_container_width=True, height=260)
@@ -790,8 +809,26 @@ with st.expander("Aperçu DEPENSES (détail colonnes)"):
 st.markdown("### Écritures générées")
 st.dataframe(out_df, use_container_width=True, height=450)
 
+st.markdown("### Contrôle équilibre Débit / Crédit par pièce")
+st.dataframe(bal_df, use_container_width=True, height=220)
+
+if not unbalanced.empty:
+    st.error("Certaines pièces ne sont PAS équilibrées (Débit ≠ Crédit). Regarde le tableau ci-dessus.")
+else:
+    st.success("Toutes les pièces sont équilibrées (Débit = Crédit).")
+
+if issues:
+    st.warning("Contrôles / Paramétrage : certaines colonnes ont été ignorées (compte vide / param manquant / TVA non paramétrée).")
+    with st.expander("Voir le détail des contrôles"):
+        st.dataframe(pd.DataFrame(issues), use_container_width=True, height=260)
+
+# ============================================================
+# Export
+# ============================================================
+st.subheader("6) Export")
+
 if out_df.empty:
-    st.info("Aucune écriture générée (vérifie le paramétrage: type/compte).")
+    st.info("Aucune écriture générée (souvent: comptes vides / paramétrage manquant).")
 else:
     csv_bytes = out_df.to_csv(index=False, sep=";").encode("utf-8")
     st.download_button(
@@ -802,7 +839,7 @@ else:
     )
 
 st.caption(
-    "Notes: Les colonnes TOTAL sont ignorées automatiquement. "
-    "Le paramétrage est basé sur (bloc + libellé colonne). "
-    "Si un libellé change, il apparaîtra dans la liste des colonnes détectées et tu pourras l'ajouter au param."
+    "Règles: colonnes TOTAL / SOLDE PROGRESSIF / INTITULÉ sont ignorées. "
+    "Si une colonne a un compte vide, aucune écriture n'est créée pour cette colonne (et c'est listé en contrôle). "
+    "TVA collectée/déductible est ventilée par taux (2.1 / 5.5 / 10 / 20%)."
 )
